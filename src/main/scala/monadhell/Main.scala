@@ -3,6 +3,7 @@ package monadhell
 import monix.eval.Task
 import scalaz._, Scalaz._
 import shims._
+import Core._
 
 object Main {
 
@@ -14,14 +15,6 @@ object Main {
   implicit class EffectOps[A](val effect: Effect[Unit]) extends AnyVal {
     def forever: Effect[Unit] = effect.flatMap { _ => forever }
   }
-
-  sealed trait TempUnit
-  case object Celsius    extends TempUnit
-  case object Fahrenheit extends TempUnit
-
-  case class Temperature(value: Int, unit: TempUnit = Celsius)
-  case class Forecast(temperature: Temperature)
-  case class City(name: String)
 
   class WeatherClient(host: String, port: Int) {
     def forecast(city: City): Task[Forecast] = Task.delay {
@@ -35,42 +28,17 @@ object Main {
 
   case class Config(host: String, port: Int)
 
-  sealed trait Error
-  case class UnknownCity(city: String) extends Error
+  def printLn(line: String): Task[Unit]   = Task.delay(println(line))
+  def readLn               : Task[String] = Task.delay(scala.io.StdIn.readLine)
 
-  type Requests = Map[City, Forecast]
-
-  object Requests {
-
-    implicit val order: Order[(City, Forecast)] =
-      Order.order[(City, Forecast)](_._2.temperature.value cmp _._2.temperature.value)
-
-    def empty: Requests                                       = Map.empty[City, Forecast]
-    def hottest(requests: Requests): Option[(City, Forecast)] = requests.toList.maximum
-  }
-
-  def printLn(line: String): Task[Unit] = Task.delay(println(line))
-  def readLn: Task[String]              = Task.delay(scala.io.StdIn.readLine)
-
-  def cityByName(cityName: String): Error \/ City = cityName match {
-    case "Wroclaw" => \/-(City(cityName))
-    case "London" => \/-(City(cityName))
-    case "Jakarta" => \/-(City(cityName))
-    case _ => -\/(UnknownCity(cityName))
-  }
-
-  def hottestCity: State[Requests, Option[(City, Temperature)]] = State { reqs =>
-    val temper = Requests.hottest(reqs).map(f => (f._1, f._2.temperature))
-    (reqs, temper)
-  }
-
-  def weatherTask(city: City)(host: String, port: Int): Task[Forecast] =
+  def findWeather(city: City)(host: String, port: Int): Task[Forecast] =
     new WeatherClient(host, port).forecast(city)
 
-  def askCityTask: Task[String] = for {
-    _    <- printLn("What is the next city?")
-    name <- readLn
-  } yield name
+  def inputCity: Task[String] =
+    for {
+      _    <- printLn("What is the next city?")
+      name <- readLn
+    } yield name
 
   def fetchForecast(city: City)(host: String, port: Int): RequestsStateT[Task, Forecast] =
     for {
@@ -78,15 +46,16 @@ object Main {
                        Task.delay((reqs, reqs.get(city)))
                      }
       forecast  <- StateT { reqs: Requests =>
-                       mForecast.cata(_.pure[Task], weatherTask(city)(host, port)).map(f => (reqs, f))
+                       mForecast.cata(_.pure[Task], findWeather(city)(host, port)).map(f => (reqs, f))
                      }
       _         <- StateT { reqs: Requests =>
                        Task.delay((reqs + (city -> forecast), ()))
                      }
     } yield forecast
 
-  val askFetchJudge: Effect[Unit] = for {
-      cityName <- askCityTask
+  val askFetchJudge: Effect[Unit] =
+    for {
+      cityName <- inputCity
                     .liftM[ErrorEitherT]
                     .liftM[RequestsStateT]
       city     <- EitherT.fromDisjunction[Task](cityByName(cityName))
@@ -107,17 +76,22 @@ object Main {
                     .liftM[RequestsStateT]
     } yield ()
 
-  val program: Effect[Unit] = for {
-    _ <- askFetchJudge.forever
-  } yield ()
+  val program: Effect[Unit] =
+    for {
+      _ <- askFetchJudge.forever
+    } yield ()
+
+  implicit val errorShows: Show[Error] = Show.shows {
+    case UnknownCity(city) => s"city $city is unknown"
+  }
 
   def main(args: Array[String]): Unit = {
 
     import monix.execution.Scheduler.Implicits.global
 
     (program.run(Requests.empty).run >>= {
-       case -\/(error) => printLn(s"Encountered an error: $error")
-       case \/-(_)     => ().pure[Task]
+       case -\/ (error)  => printLn(s"Encountered an error: ${error.shows}")
+       case  \/-(_)      => ().pure[Task]
      }).runSyncUnsafe()
   }
 }
